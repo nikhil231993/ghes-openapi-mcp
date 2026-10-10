@@ -85,9 +85,12 @@ Finds the spec that defines an API URL. It searches, locates and fetches in one 
 | `max_candidates` | `200` | The most YAML/JSON files to scan |
 
 It returns:
-- `matches`: the ranked specs, each with its `matched_operations`
+- `matches`: the ranked specs, each with its `matched_operations`, `version` and `status`
+  (from its metadata file, see below). Every spec tied for the top score is listed, plus
+  lower-scoring ones up to 5 in total.
+- `total_matches`: how many specs matched in all
 - `best`: the top spec's path and content, plus its `$ref` files
-- `notes`: warnings, e.g. when two specs match equally well
+- `notes`: warnings, e.g. which of several equally good specs was picked, and why
 
 Why use it alongside the 3 GitHub tools:
 - Concrete values match templates: `C123` matches `/customers/{customerId}`. Code search
@@ -111,7 +114,16 @@ Why use it alongside the 3 GitHub tools:
      `/customers/{id}/v1/address`. At least one literal segment must match.
    - There are bonuses for literal segments over `{params}`, a matching host and a matching method.
 5. If nothing matches, fall back to a case-insensitive text search of the specs.
-6. Return the top specs. The best one comes with its content and its `$ref` files.
+6. Rank the specs by score. When several tie, which is common when every version of an
+   API defines the same path, prefer:
+   1. the spec whose metadata file says `status: ACTIVE`. The metadata file sits next to
+      the spec: `X_v1.14.yaml` → `X_v1.14.metadata.yaml` (or `.yml`/`.json`). `DEPRECATED`
+      and `RETIRED` rank lowest; specs without a metadata file rank in between.
+   2. then the highest `info.version`, compared as numbers (1.14 beats 1.9).
+
+   Score always comes first: an exact match in a `DEPRECATED` spec still beats a weaker
+   match in an `ACTIVE` one.
+7. Return the specs. The best one comes with its content and its `$ref` files.
 
 ## Setup
 
@@ -299,6 +311,32 @@ To have VS Code ask for the token instead of keeping it in `.env`:
 }
 ```
 
+### Cursor: `.cursor/mcp.json`
+
+Create `.cursor/mcp.json` in the project you open in Cursor (or `~/.cursor/mcp.json` to use it
+in every project):
+
+```json
+{
+  "mcpServers": {
+    "ghes-openapi": {
+      "command": "/absolute/path/to/ghes-openapi-mcp/.venv/bin/ghes-openapi-mcp"
+    }
+  }
+}
+```
+
+The settings come from this project's `.env`, wherever Cursor is opened. Then:
+
+1. Open **Cursor Settings → MCP** (**Tools & MCP** in newer versions). `ghes-openapi` should
+   show a green dot and 4 tools. A red dot means the server failed to start; click it to see
+   the error, which is usually a missing `.env` value or a wrong path.
+2. Open the chat in **Agent** mode. MCP tools are only used in Agent mode.
+3. Ask, for example: *"Use find_openapi_spec to find the spec for GET /payments/v1/payments/123
+   and show the operation."* Cursor asks before running each tool call unless you allow it.
+
+After changing `.env` or the code, turn the server off and on in the MCP settings so it restarts.
+
 ### Claude Desktop: `claude_desktop_config.json`
 
 ```json
@@ -333,6 +371,38 @@ get_file_contents   { "owner": "my-org", "repo": "contract-api-specs",
                       "ref": "refs/heads/main" }                                         // 3. pull it
 ```
 
+## Using it with a dependency graph
+
+The intended flow: a code dependency graph tool (for example `downstream_apis`) lists the APIs a
+service calls, and this server finds the OpenAPI spec for each one.
+
+```
+downstream_apis(service)                 →  ["GET https://pay.example.internal/payments/v1/payments/{id}", ...]
+for each endpoint:
+  find_openapi_spec(api_url=<url or path>, method=<GET/POST/...>, include_content=false)
+                                         →  best.path, matched_operations, status, version
+  get_file_contents(path=best.path)      →  the spec, only when the full text is needed
+```
+
+- **Pass the endpoint as it comes.** Full URLs, host plus path, bare paths, concrete IDs
+  (`/payments/123`) and code placeholders (`${id}`, `:id`, `%s`) all match `{param}` templates.
+  A query string is ignored.
+- **Pass `method`** when you know it. It breaks ties between operations on the same path.
+- **Use `include_content=false`** when looking up many endpoints. It returns only the ranking,
+  which is much smaller. Fetch the one spec you need afterwards.
+- **Check `notes`** in each result. They say when several versions tied and which one was
+  picked, or when the scan was cut short.
+- **If the graph returns a client method name** instead of a URL (for example
+  `PaymentsClient.getPayment`), `find_openapi_spec` can't match it. Search for the `operationId`
+  with `search_code` instead, or add operationId matching (see
+  [Known limitations](#known-limitations-and-next-steps)).
+
+An instruction you can give the agent:
+
+> For each API returned by downstream_apis, call find_openapi_spec with the URL and the HTTP
+> method, and include_content=false. Report the spec path, the status, the version and the
+> matched operation. If notes say the result is uncertain, show them.
+
 ## Compared with GitHub's official MCP server
 
 We ran the official `github-mcp-server` (v2.0.2) and this server side by side against a
@@ -350,7 +420,195 @@ GitHub API objects with extra URL fields. The data inside is the same.
 The official server also supports GHES through its `--gh-host` option. If you are allowed to
 run its binary against your GHES, it's an alternative to the 3 GitHub-style tools.
 
+## First test on a company GHES
+
+A checklist for the first run on a work laptop. Do it from inside the company network or VPN:
+a company GHES is usually not reachable from outside.
+
+The commands are for macOS or Linux (bash or zsh) and need `jq`. On Windows, run them in
+Git Bash or WSL, and use `.venv\Scripts\ghes-openapi-mcp.exe` as the server path. Or skip the
+commands and call the tools from the Inspector browser UI or from Cursor (see [Cursor](#cursor-cursormcpjson)).
+
+### 1. Install and configure
+
+Follow [Setup](#setup) steps 1–4. Take `GHES_BASE_URL`, `GHES_DEFAULT_OWNER` and
+`GHES_DEFAULT_REPO` from the spec repo's browser address, `https://<host>/<owner>/<repo>`, and
+copy the repo name exactly. Keep these values in `.env` only, not in any committed file.
+
+Check that the fast YAML parser is installed. Large specs parse much more slowly without it:
+
+```bash
+.venv/bin/python -c "import yaml; print(yaml.__with_libyaml__)"    # should print True
+```
+
+### 2. Call each tool with the Inspector CLI
+
+Run these from the project folder so the server picks up `.env`. `2>/dev/null` hides its
+HTTP log lines. `npx` needs access to the npm registry; if it's blocked, use the browser UI
+or your MCP client instead.
+
+```bash
+g() { npx -y @modelcontextprotocol/inspector --cli ./.venv/bin/ghes-openapi-mcp "$@"; }   # works in bash and zsh
+
+# a. Can it read the repo? How big is it?
+g --method tools/call --tool-name get_repository_tree \
+  --tool-arg recursive=true --tool-arg spec_files_only=true --tool-arg limit=5000 \
+  2>/dev/null > tree.json
+
+# b. Is code search enabled on this GHES?
+g --method tools/call --tool-name search_code \
+  --tool-arg query=openapi --tool-arg perPage=5 2>/dev/null
+
+# c. Does a real endpoint resolve to the right spec? (use one your code actually calls)
+g --method tools/call --tool-name find_openapi_spec \
+  --tool-arg api_url=/payments/v1/payments/123 --tool-arg method=GET \
+  --tool-arg include_content=false 2>/dev/null
+
+# d. Can it fetch a spec file? (a path from tree.json)
+g --method tools/call --tool-name get_file_contents \
+  --tool-arg path=<path/from/tree.json> 2>/dev/null | head -c 500
+```
+
+Summarise `tree.json`:
+
+```bash
+jq '.content[0].text | fromjson | {tree_truncated, spec_files: .total_entries,
+    over_384KB: [.entries[] | select(.size > 393216)] | length,
+    largest_KB: ([.entries[].size] | max / 1024 | floor)}' tree.json
+```
+
+### 3. Read the results
+
+| Check | Good | If not |
+|---|---|---|
+| a. tree call | Returns entries | 401/403/404: see [Troubleshooting](#troubleshooting). TLS error: set `GHES_CA_BUNDLE`. |
+| `tree_truncated` | `false` | The repo is too large for one tree listing. Pass `path_prefix` to `find_openapi_spec`. |
+| `spec_files` | 200 or fewer | `find_openapi_spec` scans only the first `max_candidates` (default 200) files, in path order, and `.metadata.yaml` files count towards that. Pass a larger `max_candidates` or a `path_prefix`, and expect slow calls. |
+| `over_384KB` | `0` | Code search can't see those files. `find_openapi_spec` and `get_file_contents` still can. |
+| b. search | Returns hits | Code search is disabled or not indexed on this GHES. The other three tools don't use it. |
+| c. find | `best.path` is the spec you expected | Check `matches` and `notes`. Try the full URL, or set `path_prefix`. |
+| d. file | Spec text | Check the path and the ref. |
+
+Note how long call c takes. Each call downloads and parses every candidate spec again, so a
+repo of large bundled specs makes it slow.
+
+## Known limitations and next steps
+
+The server has been tested against a small github.com repo (24 YAML files), not yet against a
+company GHES. These are the known gaps for a large central spec repo, most important first.
+Each one names the code to change. Run `pytest` after every change and add a test next to the
+existing ones in `tests/`.
+
+### 1. Only the first 200 files are scanned
+
+`find_openapi_spec` scans at most `max_candidates` (default 200) YAML/JSON files.
+`rank_candidates` in `spec.py` sorts them so that names containing `openapi`, `swagger` or `api`
+come first, then by folder depth, then alphabetically. Names like `Payments_v1.14.yaml` get no
+priority, so in a repo with more than 200 files the specs of later folders are never read and
+the tool reports no match although the spec exists.
+
+Fix: remove the cap, or raise it well above the repo's file count. Together with fix 3 this
+costs little, because each file is parsed only once.
+
+### 2. Metadata files count as candidates
+
+`*.metadata.yaml` files pass `is_candidate` in `spec.py`, take up candidate slots and are
+downloaded, then dropped by `load_spec` because they have no `openapi` key.
+
+Fix: in `is_candidate`, return `False` for names ending in `.metadata.yaml`, `.metadata.yml`
+or `.metadata.json`. The status lookup reads them separately (`metadata_paths`,
+`_load_status` in `finder.py`), so nothing else changes.
+
+### 3. Every call re-reads the whole repo
+
+`find_spec` in `finder.py` fetches the tree, then downloads and parses every candidate on each
+call. File content is cached by SHA (`get_blob` in `github_client.py`), but parsing isn't, and
+the tree is fetched again each time. With hundreds of large bundled specs and dozens of
+endpoints, this is slow and uses many API requests.
+
+Fix: build an index once and reuse it.
+- Key it by the tree SHA, which `get_tree` already returns, so it rebuilds by itself when the
+  repo changes.
+- Per spec, store the path, `spec_summary(doc)`, the server base paths
+  (`_base_paths_and_hosts`), the path templates with their methods, and the metadata status.
+  Don't keep the parsed documents: they are large.
+- Look endpoints up in the index with `match_paths`, which only needs `paths` and `servers`.
+  Load the best spec's text only when `include_content=true`.
+- Optionally also look up the current tree SHA at most once a minute, to save the tree request.
+
+### 4. No retries
+
+`_get` in `github_client.py` fails at once on a 5xx error, a 429, or a 403 caused by a secondary
+rate limit. A lookup over many endpoints will hit these.
+
+Fix: retry up to 3 times with exponential backoff, waiting for the `Retry-After` header when
+GitHub sends one. Don't retry other 4xx errors.
+
+### 5. Client method names don't match
+
+`find_openapi_spec` matches URLs and paths only. If the dependency graph returns
+`PaymentsClient.getPayment` instead of a URL, it finds nothing.
+
+Fix: add an `operation_id` parameter that matches the `operationId` of each operation,
+case-insensitively. Store operationIds in the index from fix 3.
+
+### Alternative for the 3 GitHub-style tools
+
+GitHub's official MCP server works with GHES when run locally with `GITHUB_HOST=https://<host>`
+(or `--gh-host`). If the company allows that, it can provide `search_code`,
+`get_repository_tree` and `get_file_contents`, and this server is needed only for
+`find_openapi_spec`. Note its `get_file_contents` returns only a link for files of 1 MB or
+more, and code search skips files over 384 KB, so large bundled specs still need
+`find_openapi_spec`.
+
 ## Troubleshooting
+
+### Find where it fails
+
+Check each layer in order. Stop at the first one that fails: that's where the problem is.
+
+| # | Layer | Check | Works if |
+|---|---|---|---|
+| 1 | Network and token | `set -a && source .env && set +a` then `curl -sS -H "Authorization: Bearer $GHES_TOKEN" "$GHES_BASE_URL/api/v3/repos/$GHES_DEFAULT_OWNER/$GHES_DEFAULT_REPO" \| head` | You see the repo's JSON. Otherwise, the problem is the network, the TLS certificate, the token or access, not this code. (For github.com, use `https://api.github.com/repos/...` instead.) |
+| 2 | Python install | `.venv/bin/python -c "import ghes_openapi_mcp, mcp, httpx, yaml; print('ok')"` | It prints `ok`. Otherwise, redo [Setup](#setup) step 1. |
+| 3 | The server itself | Run the Inspector commands in [First test](#2-call-each-tool-with-the-inspector-cli) without `2>/dev/null` | The tool result is JSON. The server's log lines, including each `HTTP Request: GET … "HTTP/1.1 200 OK"`, show the exact URL and status GHES returned. |
+| 4 | Cursor | Cursor Settings → MCP shows a green dot and 4 tools | If layer 3 works but this doesn't, the cause is the path in `.cursor/mcp.json`. Check Cursor's server log: **View → Output**, then choose the MCP log in the dropdown. |
+| 5 | The answer | Call `find_openapi_spec` and read `notes`, `candidate_files`, `candidates_scanned`, `specs_parsed` and `total_matches` | See "Wrong or missing results" below |
+
+When asking Cursor's AI for help, paste the output of the first layer that fails, including
+the server's log lines.
+
+### Corporate network problems
+
+These are likely on a company laptop and aren't caused by this code:
+
+- **Proxy.** The server uses `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY` from the environment.
+  An internal GHES usually must *not* go through the proxy: if requests time out or the proxy
+  returns an error, add the GHES host to `NO_PROXY`, for example
+  `NO_PROXY=github.your-company.internal`, in `.env` or in the shell that starts the server.
+- **TLS certificate errors** (`CERTIFICATE_VERIFY_FAILED`). Python doesn't use the operating
+  system's certificate store, so it doesn't trust the company's root CA. Get the CA as a PEM
+  file and set `GHES_CA_BUNDLE` to its path.
+  - Ask IT for the root CA, or export it from the browser's padlock dialog on the GHES page.
+  - On macOS, this writes every certificate the system trusts to one file, which works as the
+    bundle:
+    `security find-certificate -a -p /System/Library/Keychains/SystemRootCertificates.keychain /Library/Keychains/System.keychain > ~/company-ca.pem`
+- **`pip install` fails** because PyPI is blocked. Use the company's package mirror, for
+  example `pip install --index-url https://<mirror>/simple -r requirements.txt -e .`, or set
+  `PIP_INDEX_URL`. Ask IT for the mirror URL. The same applies to `npx` and the npm registry.
+- **Python too old.** Check `python3 --version` is 3.10 or later.
+
+### Wrong or missing results
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `best` is null and `notes` says nothing matched | The spec wasn't scanned, or its path differs from the URL | Compare `candidate_files` with `candidates_scanned`. If fewer were scanned, see [limitation 1](#1-only-the-first-200-files-are-scanned). Otherwise, check the spec's `servers` and `paths` with `get_file_contents`. |
+| `specs_parsed` is much lower than `candidates_scanned` | Many YAML/JSON files aren't OpenAPI specs (or failed to parse) | Expected for metadata files. If real specs are missing, check that they have a top-level `openapi` or `swagger` key and are valid YAML/JSON. |
+| The wrong version was picked | Several versions tied | Read `notes` and `matches`. Make sure the metadata files say `status: ACTIVE` for the current version. |
+| A spec from another API was picked | A short or generic URL, e.g. `/v1/status`, matches many specs | Pass the full URL with host and base path, and `method`. |
+| The call is very slow | Every call re-reads every spec | Use `path_prefix` and `include_content=false`; see [limitation 3](#3-every-call-re-reads-the-whole-repo). |
+
+### Error messages
 
 | Error | Fix |
 |---|---|
@@ -359,7 +617,8 @@ run its binary against your GHES, it's an alternative to the 3 GitHub-style tool
 | 403 `Forbidden` | The token can't see the repo. Check its repository access, the Contents permission and SSO authorization. |
 | 403 `rate limit` | Wait until the reset time in the message. GHES limits are set by your admins. |
 | 404 `Not found` | Check the owner, repo, path and ref. A token without access to a private repo also gets a 404. |
-| TLS or certificate errors | Set `GHES_CA_BUNDLE` to your corporate root CA file |
+| TLS or certificate errors | Set `GHES_CA_BUNDLE` to your corporate root CA file; see [Corporate network problems](#corporate-network-problems) |
+| `Could not reach GHES` (timeout or connection error) | You're off the company network or VPN, or the proxy is in the way; check `NO_PROXY` |
 | `search_code` returns nothing or an error | Code search may be disabled on your GHES, or the file is over 384 KB or not on the default branch. Use `find_openapi_spec` or `get_repository_tree` with `get_file_contents`. |
 
 ## Development

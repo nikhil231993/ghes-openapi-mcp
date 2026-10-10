@@ -13,9 +13,12 @@ from .spec import (
     load_spec,
     match_paths,
     parse_api_url,
+    metadata_paths,
     rank_candidates,
     resolve_ref_path,
     spec_summary,
+    status_rank,
+    version_key,
 )
 
 MAX_REF_FILES = 200
@@ -55,6 +58,41 @@ async def _load_candidates(
 
     results = await asyncio.gather(*(load(e) for e in entries))
     return [r for r in results if r is not None]
+
+
+async def _load_status(
+    client: GHESClient, owner: str, repo: str, spec_path: str, blob_shas: dict[str, str]
+) -> tuple[str | None, str | None]:
+    """(status, metadata path) from the spec's sibling metadata file, e.g. X.metadata.yaml."""
+    for path in metadata_paths(spec_path):
+        if path not in blob_shas:
+            continue
+        try:
+            meta = yaml.safe_load(await client.get_blob(owner, repo, blob_shas[path]))
+        except (GHESError, yaml.YAMLError):
+            return None, path
+        status = meta.get("status") if isinstance(meta, dict) else None
+        return (str(status).upper() if status else None), path
+    return None, None
+
+
+def _rank_key(match: dict[str, Any]) -> tuple[Any, ...]:
+    """Best score first; on a tie, an ACTIVE spec, then the highest version."""
+    return (match["score"], status_rank(match.get("status")), version_key(match.get("version")))
+
+
+def _tie_note(tied: list[dict[str, Any]]) -> str:
+    best = tied[0]
+    versions = ", ".join(str(m.get("version")) for m in tied)
+    reason = (
+        f"its metadata says status {best['status']}"
+        if best.get("status") and status_rank(best["status"]) > status_rank(tied[1].get("status"))
+        else "it has the highest version"
+    )
+    return (
+        f"{len(tied)} specs matched equally well (versions {versions}). 'best' is "
+        f"{best['path']} because {reason}. Check 'matches' if you need another version."
+    )
 
 
 async def _resolve_refs(
@@ -105,7 +143,7 @@ async def find_spec(
     max_candidates: int = 200,
     include_content: bool = True,
     resolve_refs: bool = True,
-    top_n: int = 5,
+    top_n: int = 5,  # plus every spec tied for the top score
     concurrency: int = 8,
 ) -> dict[str, Any]:
     tree = await client.get_tree(owner, repo, ref)
@@ -128,8 +166,6 @@ async def find_spec(
                 "matched_operations": [m.to_dict() for m in matches[:10]],
             }
         )
-    ranked.sort(key=lambda r: r["score"], reverse=True)
-
     # No spec defines a matching path, so fall back to a plain text search of the specs,
     # like search_code: the path may appear in a description, an x- extension, a $ref...
     text_search = None
@@ -142,7 +178,18 @@ async def find_spec(
                 ranked.append(
                     {"path": path, "score": len(hits), **spec_summary(doc), "text_matches": hits}
                 )
-        ranked.sort(key=lambda r: r["score"], reverse=True)
+
+    # Versions of the same API often define the same path and tie on score. Break ties with
+    # the lifecycle status in each spec's metadata file (ACTIVE first), then the version.
+    statuses = await asyncio.gather(
+        *(_load_status(client, owner, repo, m["path"], blob_shas) for m in ranked)
+    )
+    for match, (status, meta_path) in zip(ranked, statuses):
+        match["status"] = status
+        if meta_path:
+            match["metadata_path"] = meta_path
+    ranked.sort(key=_rank_key, reverse=True)
+    tied = [m for m in ranked if m["score"] == ranked[0]["score"]] if ranked else []
 
     result: dict[str, Any] = {
         "query": {"api_url": api_url, "method": method},
@@ -152,7 +199,8 @@ async def find_spec(
         "candidate_files": len(candidates),
         "candidates_scanned": min(len(candidates), max_candidates),
         "specs_parsed": len(specs),
-        "matches": ranked[:top_n],
+        "total_matches": len(ranked),
+        "matches": ranked[: max(top_n, len(tied))],
         "best": None,
     }
     notes = []
@@ -192,8 +240,13 @@ async def find_spec(
             best["referenced_file_paths"] = sorted(refs["files"])
         if refs["missing"]:
             best["missing_refs"] = refs["missing"]
-    if len(ranked) > 1 and ranked[1]["score"] == ranked[0]["score"]:
-        notes.append("More than one spec matched equally well; check 'matches' before trusting 'best'.")
+    if len(tied) > 1:
+        notes.append(_tie_note(tied))
+    if len(ranked) > len(result["matches"]):
+        notes.append(
+            f"Showing {len(result['matches'])} of {len(ranked)} matching specs; "
+            "the rest scored lower."
+        )
 
     result["best"] = best
     if notes:

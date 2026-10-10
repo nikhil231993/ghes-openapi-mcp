@@ -107,6 +107,27 @@ def spec_summary(doc: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# ---- choosing between versions of the same spec --------------------------------
+
+# Lifecycle states, best first. Unknown or missing states rank between ACTIVE and these.
+STATUS_RANK = {"ACTIVE": 3, "CURRENT": 3, "PUBLISHED": 3, "BETA": 1, "DEPRECATED": 0, "RETIRED": 0}
+
+
+def metadata_paths(spec_path: str) -> list[str]:
+    """Where a spec's metadata file may live: 'a/X_v1.2.yaml' -> 'a/X_v1.2.metadata.yaml', ..."""
+    stem = posixpath.splitext(spec_path)[0]
+    return [f"{stem}.metadata{ext}" for ext in SPEC_EXTENSIONS]
+
+
+def status_rank(status: str | None) -> int:
+    return STATUS_RANK.get((status or "").strip().upper(), 2)
+
+
+def version_key(version: Any) -> tuple[int, ...]:
+    """Compare versions as numbers: '1.14.0' -> (1, 14, 0), which beats '1.9.0' -> (1, 9, 0)."""
+    return tuple(int(n) for n in re.findall(r"\d+", str(version or "")))
+
+
 def external_refs(doc: Any) -> set[str]:
     """File parts of every relative `$ref` (e.g. './schemas/pay.yaml#/Pay' -> './schemas/pay.yaml')."""
     found: set[str] = set()
