@@ -82,6 +82,11 @@ async def test_get_repository_tree_recursive_and_filtered():
     assert [e["type"] for e in result["entries"]] == ["tree"]
 
 
+async def test_get_repository_tree_trailing_slash_filter_matches_official():
+    result = await server.get_repository_tree("my-org", "my-service", recursive=True, path_filter="api/")
+    assert [e["path"] for e in result["entries"]] == ["api/openapi.yaml"]
+
+
 async def test_get_repository_tree_accepts_full_ref_name():
     await server.get_repository_tree("my-org", "my-service", tree_sha="refs/heads/main")
     assert REQUESTS[-1].url.path.endswith("/git/trees/main")

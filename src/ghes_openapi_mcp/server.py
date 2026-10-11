@@ -110,7 +110,9 @@ async def get_repository_tree(
     client, settings = _get_client()
     owner, repo = _repo(owner, repo, settings)
     tree = await client.get_tree(owner, repo, tree_sha, recursive=recursive)
-    prefix = (path_filter or "").strip("/")
+    # Plain prefix match, like the official server: "payments/" excludes the "payments"
+    # entry itself and siblings such as "payments-legacy/".
+    prefix = (path_filter or "").lstrip("/")
     entries = [
         {"path": e["path"], "type": e.get("type"), "size": e.get("size"), "sha": e.get("sha")}
         for e in tree["entries"]
